@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🏓 乒乓球對抗賽 - 模擬計分看板</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #121212; color: #fff; text-align: center; padding: 20px; }
+    h1 { font-size: 2rem; margin-bottom: 5px; color: #f1f1f1; }
+    p.subtitle { color: #aaa; margin-bottom: 25px; font-size: 0.95rem; }
+    .scoreboard { display: flex; justify-content: center; gap: 20px; max-width: 650px; margin: 0 auto; }
+    .card { flex: 1; padding: 25px; border-radius: 20px; box-shadow: 0 10px 20px rgba(0,0,0,0.5); }
+    .red { background: linear-gradient(135deg, #ff416c, #ff4b2b); }
+    .blue { background: linear-gradient(135deg, #2193b0, #6dd5ed); }
+    .team-title { font-size: 1.5rem; font-weight: bold; margin-bottom: 15px; }
+    .score { font-size: 5rem; font-weight: 800; text-shadow: 2px 4px 10px rgba(0,0,0,0.3); }
+    .btn-group { display: flex; justify-content: center; gap: 10px; margin-top: 15px; }
+    .btn-minus { background-color: rgba(0, 0, 0, 0.4); color: white; border: 2px solid rgba(255,255,255,0.8); padding: 8px 16px; font-size: 0.9rem; font-weight: bold; border-radius: 12px; cursor: pointer; transition: 0.2s; }
+    .btn-minus:hover { background-color: rgba(0, 0, 0, 0.7); transform: scale(1.05); }
+    .btn-container { margin-top: 30px; }
+    .btn-reset { background-color: #e50914; color: white; border: none; padding: 12px 30px; font-size: 1.1rem; font-weight: bold; border-radius: 30px; cursor: pointer; transition: 0.2s; }
+  </style>
+</head>
+<body>
+  <h1>🏓 乒乓球自動計分系統 (展示版)</h1>
+  <p class="subtitle">🔒 得分由 FC-51 感測器自動判定 | 網頁僅提供裁判違規扣分與重置</p>
+
+  <div class="scoreboard">
+    <div class="card red">
+      <div class="team-title">🔴 紅隊</div>
+      <div class="score" id="red-score">0</div>
+      <div class="btn-group">
+        <button class="btn-minus" onclick="penalty('red')">⚠️ 違規扣 1 分</button>
+      </div>
+    </div>
+    
+    <div class="card blue">
+      <div class="team-title">🔵 藍隊</div>
+      <div class="score" id="blue-score">0</div>
+      <div class="btn-group">
+        <button class="btn-minus" onclick="penalty('blue')">⚠️ 違規扣 1 分</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="btn-container">
+    <button class="btn-reset" onclick="resetScore()">重新開始 (Reset)</button>
+  </div>
+
+  <script>
+    let redScore = 0;
+    let blueScore = 0;
+
+    function penalty(team) {
+      if (team === 'red' && redScore > 0) redScore--;
+      if (team === 'blue' && blueScore > 0) blueScore--;
+      updateDisplay();
+    }
+
+    function resetScore() {
+      redScore = 0;
+      blueScore = 0;
+      updateDisplay();
+    }
+
+    function updateDisplay() {
+      document.getElementById('red-score').innerText = redScore;
+      document.getElementById('blue-score').innerText = blueScore;
+    }
+  </script>
+</body>
+</html>
