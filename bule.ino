@@ -1,11 +1,12 @@
 /*
- * ESP32 + FC-51 雙隊自動計分系統（v5：三塊 ESP32 —— 藍隊感測節點 NODE）
+ * ESP32 + FC-51 雙隊自動計分系統（v6：藍隊感測節點 NODE）
  *
+ * 本程式功能：
  *  - 讀取藍隊 FC-51（GPIO 19），做防彈跳與鎖定
  *  - 偵測到進球 -> 用 ESP-NOW 傳給主機（有確認機制，失敗會自動重送）
  *  - 每秒送一次心跳，讓主機的裁判頁面顯示「節點已連線」
- *  - 不需要路由器、不需要 Wi-Fi 帳密
- *  - 會自動搜尋主機所在的頻道
+ *  - 不需要連 Wi-Fi、不需要帳密
+ *  - 自動搜尋主機所在的頻道（主機固定在頻道 1，通常第一次就連上）
  *
  * 接線（節點）：
  *  FC-51 VCC -> 3V3 ； GND -> GND ； OUT -> GPIO 19（藍隊）
@@ -18,16 +19,18 @@
 #include <esp_wifi.h>
 
 // ======================================================
-// 1. 設定（換了主機板就要改 MASTER_MAC）
+// 1. 設定
 // ======================================================
 
-uint8_t MASTER_MAC[6] = {0x1C, 0x9D, 0xC2, 0xF8, 0xAD, 0x00};   // 主機的 MAC
+// ★ 必須改成主機序列埠印出的「填入節點：{...}」那一行！
+//   （舊值 1C:9D:C2:F8:AD:00 是路由器模式的 MAC，熱點版主機不能用）
+uint8_t MASTER_MAC[6] = {0x1C, 0x9D, 0xC2, 0xF8, 0xAD, 0x00};
 
 #define BLUE_SENSOR_PIN 19   // 藍隊感測器 OUT
 #define STATUS_LED       2   // 板載 LED：亮 = 已連上主機
 
 const unsigned long SENSOR_ON_TIME  = 5;     // 偵測到球需穩定多久（毫秒）
-const unsigned long SENSOR_OFF_TIME = 100;   // 球離開需穩定多久（毫秒）
+const unsigned long SENSOR_OFF_TIME = 100;   // 球離開需穩定多久（毫秒，避免彈跳重複計分）
 
 const unsigned long HEARTBEAT_MS      = 1000;  // 已連線時，心跳間隔
 const unsigned long SEARCH_INTERVAL   = 30;    // 搜尋頻道時，每次嘗試的間隔
@@ -40,14 +43,14 @@ const uint8_t       MAX_CHANNEL       = 13;    // 台灣為 1~13
 // 2. ESP-NOW 封包格式（必須與主機完全一致！）
 // ======================================================
 
-#define PKT_MAGIC      0xA5
-#define PKT_GOAL       1
-#define PKT_HEARTBEAT  2
+#define PKT_MAGIC      0xA5   // 辨識碼
+#define PKT_GOAL       1      // 進球事件
+#define PKT_HEARTBEAT  2      // 心跳
 
 struct __attribute__((packed)) Packet {
   uint8_t  magic;
   uint8_t  type;
-  uint16_t seq;
+  uint16_t seq;   // 進球流水號（重送同一球時相同，主機用它去除重複）
 };
 
 // ======================================================
@@ -55,15 +58,15 @@ struct __attribute__((packed)) Packet {
 // ======================================================
 
 // ---- 感測器狀態 ----
-int blueRawState = HIGH;
-int blueStableState = HIGH;
-unsigned long blueStateChangeTime = 0;
-bool blueLocked = false;
+int blueRawState = HIGH;               // 目前讀到的原始訊號
+int blueStableState = HIGH;            // 穩定後的訊號
+unsigned long blueStateChangeTime = 0; // 訊號最後一次變化的時間
+bool blueLocked = false;               // 球停在感測器前時鎖定，只算一次
 
 // ---- 無線傳送狀態 ----
-volatile bool sendBusy = false;
-volatile bool resultReady = false;
-volatile bool resultOk = false;
+volatile bool sendBusy = false;     // 正在等待送出結果
+volatile bool resultReady = false;  // 回呼函式已給出結果
+volatile bool resultOk = false;     // 送出結果（true = 主機有確認收到）
 
 bool linked = false;                // 是否已連上主機
 uint8_t channel = 1;                // 目前使用的頻道
@@ -73,7 +76,7 @@ int goalQueue = 0;                  // 還沒開始送的進球數
 bool goalOutstanding = false;       // 目前有一筆進球正在送（尚未確認）
 uint16_t goalSeq = 0;               // 進球流水號
 
-uint8_t inflightType = 0;
+uint8_t inflightType = 0;           // 正在送的封包類型
 unsigned long sendStartTime = 0;
 unsigned long lastGoalTry = 0;
 unsigned long lastHeartbeat = 0;
@@ -90,9 +93,10 @@ void onEspNowSent(const uint8_t* mac, esp_now_send_status_t status) {
 #endif
   resultOk = (status == ESP_NOW_SEND_SUCCESS);
   resultReady = true;
-  sendBusy = false;
+  sendBusy = false;   // 最後才放開，主迴圈看到 false 時結果一定已寫好
 }
 
+// 切換 Wi-Fi 頻道
 void setChannel(uint8_t ch) {
   esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
   channel = ch;
@@ -118,6 +122,7 @@ void registerResult(bool ok) {
   digitalWrite(STATUS_LED, linked ? HIGH : LOW);
 }
 
+// 送出一個封包（非阻塞，結果由回呼函式回報）
 void transmit(uint8_t type, uint16_t seq) {
   Packet p = {PKT_MAGIC, type, seq};
 
@@ -135,14 +140,16 @@ void transmit(uint8_t type, uint16_t seq) {
 // 每圈呼叫一次：非阻塞，不會卡住感測器偵測
 void serviceRadio(unsigned long now) {
 
+  // 正在等結果：太久沒回應就視為失敗
   if (sendBusy) {
-    if (now - sendStartTime > SEND_TIMEOUT_MS) {   // 等太久，視為失敗
+    if (now - sendStartTime > SEND_TIMEOUT_MS) {
       sendBusy = false;
       registerResult(false);
     }
     return;
   }
 
+  // 處理上一次送出的結果
   if (resultReady) {
     resultReady = false;
     registerResult(resultOk);
@@ -173,13 +180,14 @@ void serviceRadio(unsigned long now) {
 }
 
 // ======================================================
-// 5. 藍隊感測器處理
+// 5. 藍隊感測器處理（防彈跳 + 鎖定，進球時排入傳送佇列）
 // ======================================================
 
 void handleBlueSensor(unsigned long now) {
 
   int reading = digitalRead(BLUE_SENSOR_PIN);
 
+  // 訊號變化：記錄新狀態並重新計時（防彈跳）
   if (reading != blueRawState) {
     blueRawState = reading;
     blueStateChangeTime = now;
@@ -196,7 +204,7 @@ void handleBlueSensor(unsigned long now) {
     if (blueStableState == LOW && !blueLocked) {
       goalQueue++;   // 有進球！排入傳送佇列
       Serial.println("[感測器進球] 🔵 藍隊偵測到球，傳送給主機");
-      blueLocked = true;
+      blueLocked = true;   // 球停在感測器前只算一次
     }
 
     if (blueStableState == HIGH) {
@@ -223,7 +231,7 @@ void setup() {
   blueStateChangeTime = millis();
   blueLocked = (blueRawState == LOW);
 
-  // 流水號用隨機起點：節點重新開機後，主機不會把新的一球誤判成重複
+  // 進球流水號用隨機起點：節點重新開機後，主機不會把新的一球誤判成重複
   goalSeq = (uint16_t)(esp_random() & 0xFFFF);
 
   WiFi.mode(WIFI_STA);
@@ -235,6 +243,7 @@ void setup() {
   }
   esp_now_register_send_cb(onEspNowSent);
 
+  // 把主機加入通訊對象
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, MASTER_MAC, 6);
   peer.channel = 0;          // 0 = 使用目前頻道（之後會自動搜尋切換）
@@ -259,5 +268,5 @@ void loop() {
   handleBlueSensor(now);   // 先偵測感測器（最重要，確保不漏球）
   serviceRadio(now);       // 再處理無線傳送
 
-  delay(1);
+  delay(1);                // 讓出一點時間給系統
 }
