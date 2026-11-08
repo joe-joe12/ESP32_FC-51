@@ -1,0 +1,241 @@
+/*
+ * ESP32 機器人（v6）：Xbox 手把網頁控制 + 計分主機啟用／停用
+ *
+ * 紅隊、藍隊機器人共用這份程式，只要改下面的 ROBOT_TEAM 再燒錄。
+ *
+ * 功能：
+ *  - 機器人自己開 Wi-Fi 熱點（紅隊 ESP32-Robot-Red、藍隊 ESP32-Robot-Blue）
+ *  - 手機／電腦連上熱點，開 http://192.168.4.1，用瀏覽器讀取 Xbox 手把來操控
+ *  - 只有計分主機允許時才會動：
+ *      裁判在裁判頁面「已啟用」該隊機器人 而且 比賽進行中（倒數中）
+ *  - 收不到主機通知（斷訊、主機關機）超過 1 秒就自動鎖定停車
+ *
+ * 馬達接線：IN1=27、IN2=14、IN3=16、IN4=17、ENA=25（左輪 PWM）、ENB=26（右輪 PWM）
+ *
+ * 需要 Arduino-ESP32 核心 3.x（ledcAttach 是 3.x 的函式）
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <esp_now.h>
+
+// ======================================================
+// 1. 設定（燒錄前請確認 ROBOT_TEAM）
+// ======================================================
+
+#define TEAM_RED  0
+#define TEAM_BLUE 1
+
+// ★ 紅隊機器人用 TEAM_RED，藍隊機器人改成 TEAM_BLUE
+const int ROBOT_TEAM = TEAM_RED;
+
+// 馬達驅動腳位
+#define in1_pin 27   // 左輪方向
+#define in2_pin 14
+#define in3_pin 16   // 右輪方向
+#define in4_pin 17
+#define ena_pin 25   // 左輪速度（PWM）
+#define enb_pin 26   // 右輪速度（PWM）
+
+const int frq = 5000;     // PWM 頻率
+const int pwmbit = 8;     // PWM 解析度（0~255）
+
+// Wi-Fi 熱點：兩台機器人名稱不同，才不會搞混
+const char* AP_SSID = (ROBOT_TEAM == TEAM_RED) ? "ESP32-Robot-Red" : "ESP32-Robot-Blue";
+const char* AP_PASSWORD = "robot1234";
+const int AP_CHANNEL = 1;   // ★ 必須和計分主機的 AP_CHANNEL 相同，ESP-NOW 才收得到
+
+const unsigned long TIMEOUT_MS = 500;        // 超過這時間沒收到手把指令就停車
+const unsigned long LINK_TIMEOUT_MS = 1000;  // 超過這時間沒收到主機通知就鎖定
+unsigned long lastDataTime = 0;              // 最後一次收到手把指令的時間
+
+// ======================================================
+// 2. 計分主機的「可不可以動」通知（格式必須與主機一致）
+// ======================================================
+
+#define ROBOT_MAGIC 0xB7
+struct __attribute__((packed)) RobotMsg {
+  uint8_t magic;
+  uint8_t allow[2];   // allow[0] = 紅隊機器人，allow[1] = 藍隊機器人；1 = 可以動
+};
+
+volatile bool robotAllow = false;            // 主機是否允許（開機預設鎖定）
+volatile unsigned long lastLinkTime = 0;     // 最後一次收到主機通知的時間
+
+// 機器人現在能不能動：主機說可以，而且通知沒有過期
+bool canMove() {
+  return robotAllow && (millis() - lastLinkTime < LINK_TIMEOUT_MS);
+}
+
+// 處理主機傳來的通知（只取自己隊伍的欄位）
+void handleRobotMsg(const uint8_t* data, int len) {
+  if (len != (int)sizeof(RobotMsg)) return;
+  RobotMsg m;
+  memcpy(&m, data, sizeof(m));
+  if (m.magic != ROBOT_MAGIC) return;
+  robotAllow = (m.allow[ROBOT_TEAM] == 1);
+  lastLinkTime = millis();
+}
+
+// 不同版本的 Arduino-ESP32 核心，回呼函式的參數不同
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  handleRobotMsg(data, len);
+}
+#else
+void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
+  handleRobotMsg(data, len);
+}
+#endif
+
+// ======================================================
+// 3. 操控網頁（%TEAM% 會在送出前換成隊伍名稱）
+// ======================================================
+
+WebServer server(80);
+
+const char PAGE[] PROGMEM = R"HTML(
+<!doctype html><html lang="zh-Hant"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>%TEAM% 機器人控制</title>
+<style>body{font:18px sans-serif;max-width:620px;margin:2em auto;padding:0 1em;background:#111;color:#eee}button{font-size:1.1em;padding:.7em 1em}#status,#lock{padding:1em;background:#222;border-radius:8px}#lock{margin-top:.6em;font-weight:bold}</style>
+<h2>%TEAM% 機器人控制</h2><p id="status">請先將 Xbox 手把連到此裝置，再按手把任意按鍵。</p>
+<p id="lock">🔒 確認機器人狀態中…</p>
+<p>左搖桿上下：前進／後退；右搖桿左右：原地轉向；A：停止。</p>
+<button id="connect">連接／重新讀取手把</button>
+<script>
+const statusEl=document.querySelector('#status');
+const lockEl=document.querySelector('#lock');
+let busy=false;
+// 依機器人回傳的文字顯示鎖定狀態（ok = 可以動，其他 = 鎖定）
+function showLock(t){lockEl.textContent=(t==='ok')?'🟢 機器人可以操控':'🔒 機器人鎖定中（等裁判開始比賽並啟用）';}
+// 送出停止指令，並更新鎖定狀態
+function stop(){fetch('/control?left=0&right=0',{cache:'no-store'}).then(r=>r.text()).then(showLock).catch(()=>{});}
+document.querySelector('#connect').onclick=()=>{statusEl.textContent='請按一下 Xbox 手把任意按鍵，然後保持此頁開啟。';poll();};
+async function poll(){
+ if(busy)return; busy=true;
+ try{
+  const pads=navigator.getGamepads?navigator.getGamepads():[];
+  const pad=Array.from(pads).find(p=>p&&p.connected);
+  if(!pad){statusEl.textContent='尚未偵測到手把。請用藍牙／USB 將 Xbox 手把連到手機或電腦，並使用支援 Gamepad API 的瀏覽器。';stop();busy=false;setTimeout(poll,150);return;}
+  statusEl.textContent='手把已連接：'+pad.id;
+  const axisY=Math.abs(pad.axes[1]||0)>=0.10?-(pad.axes[1]||0):0;
+  const axisX=Math.abs(pad.axes[2]||0)>=0.10?-(pad.axes[2]||0):0;
+  let left=0,right=0;
+  if(axisX>0.20){left=250;right=-250;}
+  else if(axisX< -0.20){left=-250;right=250;}
+  else if(axisY!==0){left=Math.round(axisY*255);right=left;}
+  // Xbox A 通常是按鈕索引 0
+  if(pad.buttons[0]&&pad.buttons[0].pressed){left=0;right=0;}
+  const r=await fetch(`/control?left=${left}&right=${right}`,{cache:'no-store'});
+  showLock(await r.text());
+ }catch(e){statusEl.textContent='連線中斷：'+e;stop();}
+ busy=false;setTimeout(poll,50);
+}
+window.addEventListener('pagehide',stop);
+if(!('getGamepads' in navigator))statusEl.textContent='此瀏覽器不支援 Gamepad API，請改用 Chrome 或 Edge。';
+</script></html>
+)HTML";
+
+// ======================================================
+// 4. 馬達控制
+// ======================================================
+
+// 設定左右輪速度：正數前進、負數後退、0 停止（範圍 -255 ~ 255）
+void setMotors(int leftSpeed, int rightSpeed) {
+  leftSpeed = constrain(leftSpeed, -255, 255);
+  rightSpeed = constrain(rightSpeed, -255, 255);
+
+  // 左輪方向
+  if (leftSpeed > 0) {
+    digitalWrite(in1_pin, HIGH); digitalWrite(in2_pin, LOW);
+  } else if (leftSpeed < 0) {
+    digitalWrite(in1_pin, LOW); digitalWrite(in2_pin, HIGH);
+  } else {
+    digitalWrite(in1_pin, LOW); digitalWrite(in2_pin, LOW);
+  }
+
+  // 右輪方向
+  if (rightSpeed > 0) {
+    digitalWrite(in3_pin, HIGH); digitalWrite(in4_pin, LOW);
+  } else if (rightSpeed < 0) {
+    digitalWrite(in3_pin, LOW); digitalWrite(in4_pin, HIGH);
+  } else {
+    digitalWrite(in3_pin, LOW); digitalWrite(in4_pin, LOW);
+  }
+
+  // 速度（PWM）
+  ledcWrite(ena_pin, abs(leftSpeed));
+  ledcWrite(enb_pin, abs(rightSpeed));
+}
+
+// 處理網頁送來的手把指令：/control?left=..&right=..
+void handleControl() {
+  if (!server.hasArg("left") || !server.hasArg("right")) {
+    server.send(400, "text/plain", "missing motor values");
+    return;
+  }
+  int left = constrain(server.arg("left").toInt(), -255, 255);
+  int right = constrain(server.arg("right").toInt(), -255, 255);
+
+  bool ok = canMove();
+  if (ok) setMotors(left, right);   // 主機允許才動
+  else    setMotors(0, 0);          // 否則強制停車
+
+  lastDataTime = millis();
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/plain", ok ? "ok" : "locked");   // 讓網頁顯示是否鎖定
+}
+
+// ======================================================
+// 5. 初始化 setup()
+// ======================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  // 馬達腳位
+  pinMode(in1_pin, OUTPUT); pinMode(in2_pin, OUTPUT);
+  pinMode(in3_pin, OUTPUT); pinMode(in4_pin, OUTPUT);
+  ledcAttach(ena_pin, frq, pwmbit);
+  ledcAttach(enb_pin, frq, pwmbit);
+  setMotors(0, 0);
+
+  // 自己開 Wi-Fi 熱點（固定頻道，才能和主機的 ESP-NOW 對上）
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL);
+  Serial.print("Wi-Fi 熱點：");
+  Serial.println(AP_SSID);
+  Serial.print("Wi-Fi AP IP: "); Serial.println(WiFi.softAPIP());
+
+  // ESP-NOW：接收計分主機的「可不可以動」通知
+  if (esp_now_init() == ESP_OK) {
+    esp_now_register_recv_cb(onEspNowRecv);
+    Serial.println("ESP-NOW 已啟動，等待計分主機通知（開機預設鎖定）");
+  } else {
+    Serial.println("ESP-NOW 初始化失敗！機器人將一直鎖定");
+  }
+
+  // 網頁
+  server.on("/", HTTP_GET, []() {
+    String page = String(PAGE);
+    page.replace("%TEAM%", (ROBOT_TEAM == TEAM_RED) ? "🔴 紅隊" : "🔵 藍隊");
+    server.send(200, "text/html; charset=utf-8", page);
+  });
+  server.on("/control", HTTP_GET, handleControl);
+  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
+  server.begin();
+  lastDataTime = millis();
+}
+
+// ======================================================
+// 6. 主迴圈 loop()
+// ======================================================
+
+void loop() {
+  server.handleClient();
+
+  // 沒收到手把指令，或主機不允許（含斷訊）→ 停車
+  if (millis() - lastDataTime > TIMEOUT_MS || !canMove()) setMotors(0, 0);
+
+  delay(2);
+}
