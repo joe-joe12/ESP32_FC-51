@@ -1,24 +1,26 @@
 /*
- * ESP32 + FC-51 雙隊自動計分系統（v5：三塊 ESP32 —— 主機端 MASTER）
+ * ESP32 + FC-51 雙隊自動計分系統（v6：計分主機 MASTER）
  *
- * 架構：
- *   主機 MASTER   ：紅隊 FC-51(GPIO18) + 網站 + 全部比賽邏輯
- *   藍隊節點 NODE ：藍隊 FC-51(GPIO19)，用 ESP-NOW 傳進球給主機
- *   天秤開關板    ：兩個微動開關(GPIO25/26)，用 ESP-NOW 傳按壓給主機
+ * 系統共五塊 ESP32：
+ *   計分主機（本程式）：紅隊 FC-51(GPIO18) + Wi-Fi 熱點 + 網站 + 全部比賽邏輯
+ *   藍隊節點          ：藍隊 FC-51(GPIO19)，用 ESP-NOW 傳進球給主機
+ *   天秤開關板        ：兩個微動開關(GPIO25/26)，用 ESP-NOW 傳按壓給主機
+ *   紅隊機器人、藍隊機器人：主機用 ESP-NOW 廣播告訴它們「現在可不可以動」
  *
+ * 機器人規則：裁判已啟用該隊機器人 而且 比賽進行中（倒數中）才可以動
  * 天秤加倍規則：某隊天秤累計按 2 次 -> 該隊接下來 10 秒內每球算 2 分
  *
- * 網頁：
- *  /          選手看板：分數與倒數計時
- *  /referee   裁判頁面：開始比賽、記錄罰分、提前結算、重設
+ * 本主機自己開 Wi-Fi 熱點，不需要路由器：
+ *   手機連「Score-ESP32」後，選手看板 http://192.168.4.1
+ *                           裁判頁面 http://192.168.4.1/referee
  *
  * 接線（主機）：
  *  FC-51 VCC -> 3V3 ； GND -> GND ； OUT -> GPIO 18（紅隊）
  *
  * 使用方式：
- *  1. 先燒錄本程式，開啟序列埠監控視窗（115200），記下「主機 MAC 位址」
- *  2. 把該 MAC 填入節點與開關板程式的 MASTER_MAC
- *  3. 再燒錄節點與開關板程式
+ *  1. 先燒錄本程式，開啟序列埠監控視窗（115200），按 EN 鍵
+ *  2. 記下印出的「填入節點：{0x.., ...}」那一行
+ *  3. 貼到節點與開關板程式的 MASTER_MAC，再燒錄它們
  */
 
 #include <WiFi.h>
@@ -29,11 +31,12 @@
 #endif
 
 // ======================================================
-// 1. Wi-Fi 設定
+// 1. Wi-Fi 熱點設定（ESP32 自己開的網路）
 // ======================================================
 
-const char* ssid = "NNK-Temp";
-const char* password = "nt123456";
+const char* AP_SSID = "Score-ESP32";
+const char* AP_PASSWORD = "12345678";   // 至少 8 個字元，建議自己改掉
+const int   AP_CHANNEL = 1;             // 固定頻道：節點、開關板、機器人都靠它對上（機器人必須設成相同）
 
 // ======================================================
 // 2. 腳位與比賽設定
@@ -45,18 +48,22 @@ const char* password = "nt123456";
 const unsigned long ROUND_SECONDS = 150;
 const unsigned long ROUND_MS = ROUND_SECONDS * 1000UL;
 
-// 節點超過多久沒收到任何訊號，就視為離線（毫秒）
+// 節點／開關板超過多久沒收到任何訊號，就視為離線（毫秒）
 const unsigned long NODE_TIMEOUT_MS = 3000;
 
 // 天秤開關：累計按幾次觸發加倍、加倍持續多久（毫秒）
 const int PRESSES_FOR_BONUS = 2;
 const unsigned long BONUS_MS = 10000;
 
+// 通知機器人的間隔（毫秒）：每 0.1 秒廣播一次
+const unsigned long ROBOT_SEND_MS = 100;
+
 // ======================================================
-// 3. ESP-NOW 封包格式（三個程式必須完全一致！）
+// 3. ESP-NOW 封包格式（相關程式必須完全一致！）
 // ======================================================
 
-#define PKT_MAGIC         0xA5   // 辨識碼
+// ---- 節點／開關板 -> 主機 ----
+#define PKT_MAGIC         0xA5   // 辨識碼，避免收到別人的 ESP-NOW 封包
 #define PKT_GOAL          1      // 藍隊進球
 #define PKT_HEARTBEAT     2      // 藍隊節點心跳
 #define PKT_SW_RED        3      // 紅隊天秤被按一次
@@ -67,6 +74,13 @@ struct __attribute__((packed)) Packet {
   uint8_t  magic;
   uint8_t  type;
   uint16_t seq;   // 流水號（重送同一事件時相同，主機用它去除重複）
+};
+
+// ---- 主機 -> 機器人（廣播）----
+#define ROBOT_MAGIC 0xB7
+struct __attribute__((packed)) RobotMsg {
+  uint8_t magic;
+  uint8_t allow[2];   // allow[0] = 紅隊機器人，allow[1] = 藍隊機器人；1 = 可以動，0 = 鎖定
 };
 
 // ======================================================
@@ -97,31 +111,38 @@ bool redLocked = false;
 
 // ---- 藍隊節點（由 ESP-NOW 回呼更新，所以用 volatile + 臨界區保護）----
 portMUX_TYPE nodeMux = portMUX_INITIALIZER_UNLOCKED;
-volatile int pendingBlueGoals = 0;
-volatile unsigned long blueLastSeen = 0;
+volatile int pendingBlueGoals = 0;          // 已收到、尚未加到分數的藍隊進球數
+volatile unsigned long blueLastSeen = 0;    // 最後一次收到節點訊號的時間
 volatile bool blueEverSeen = false;
-int32_t lastBlueSeq = -1;
+int32_t lastBlueSeq = -1;                   // 上一個處理過的進球流水號
 
-// ---- 天秤開關板（0=紅隊 1=藍隊）----
+// ---- 天秤開關板（隊伍編號：0=紅隊 1=藍隊）----
 #define TEAM_RED  0
 #define TEAM_BLUE 1
-volatile int pendingPress[2] = {0, 0};       // 已收到、尚未處理的按壓次數
-volatile unsigned long switchLastSeen = 0;
+volatile int pendingPress[2] = {0, 0};      // 已收到、尚未處理的按壓次數
+volatile unsigned long switchLastSeen = 0;  // 最後一次收到開關板訊號的時間
 volatile bool switchEverSeen = false;
-int32_t lastSwitchSeq = -1;
-int  pressCount[2]  = {0, 0};                // 目前累計按壓次數
-bool bonusActive[2] = {false, false};        // 是否正在加倍中
-unsigned long bonusUntil[2] = {0, 0};        // 加倍結束時間（millis）
+int32_t lastSwitchSeq = -1;                 // 上一個處理過的按壓流水號
+int  pressCount[2]  = {0, 0};               // 目前累計按壓次數
+bool bonusActive[2] = {false, false};       // 該隊是否正在加倍中
+unsigned long bonusUntil[2] = {0, 0};       // 加倍結束時間（millis）
+
+// ---- 機器人（隊伍編號同上）----
+bool robotEnabled[2] = {true, true};        // 裁判是否啟用該隊機器人（預設啟用）
+unsigned long lastRobotSend = 0;            // 上次廣播通知的時間
+const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 // ======================================================
 // 5. 工具函式
 // ======================================================
 
+// 最終分數 = 得分 - 罰分，最低為 0
 int finalScore(int score, int penalty) {
   int result = score - penalty;
   return (result < 0) ? 0 : result;
 }
 
+// 狀態轉成文字，給網頁判斷用
 const char* stateName() {
   switch (gameState) {
     case RUNNING: return "running";
@@ -130,6 +151,7 @@ const char* stateName() {
   }
 }
 
+// 剩餘秒數（無條件進位）：等待中顯示完整時間，已結算顯示 0
 unsigned long remainingSeconds() {
   if (gameState == WAITING) return ROUND_SECONDS;
   if (gameState == SETTLED) return 0;
@@ -237,7 +259,22 @@ void processSwitchPresses() {
   }
 }
 
-// 同步紅隊感測器目前狀態
+// 機器人能不能動：裁判已啟用，而且比賽進行中（倒數中）
+bool robotAllowed(int team) {
+  return robotEnabled[team] && gameState == RUNNING;
+}
+
+// 廣播兩台機器人各自「可不可以動」（兩台機器人收到同一個封包，各取自己的欄位）
+void sendRobotState() {
+  RobotMsg m;
+  m.magic = ROBOT_MAGIC;
+  m.allow[TEAM_RED]  = robotAllowed(TEAM_RED)  ? 1 : 0;
+  m.allow[TEAM_BLUE] = robotAllowed(TEAM_BLUE) ? 1 : 0;
+  esp_now_send(BROADCAST_MAC, (uint8_t*)&m, sizeof(m));
+  lastRobotSend = millis();
+}
+
+// 同步紅隊感測器目前狀態（藍隊的同步由節點自己負責）
 void syncSensors() {
   redRawState = digitalRead(RED_SENSOR_PIN);
   redStableState = redRawState;
@@ -245,6 +282,7 @@ void syncSensors() {
   redLocked = (redRawState == LOW);
 }
 
+// 結算：切換為已結算狀態（時間到或裁判提前結算都會呼叫）
 void settleRound() {
   gameState = SETTLED;
   clearBonusState();
@@ -466,7 +504,7 @@ update();
 }
 
 // ======================================================
-// 8. 裁判網頁（含節點／開關板連線狀態、天秤按壓與加倍資訊）
+// 8. 裁判網頁（含連線狀態、天秤資訊、兩台機器人的啟用／停用按鈕）
 // ======================================================
 
 void handleRefereePage() {
@@ -528,6 +566,7 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
 
 .penalty { background: #d97706; }
 .undo    { background: #64748b; }
+.robot   { background: #16a34a; width: 95%; font-size: 14px; }
 .main    { background: #16a34a; width: 100%; font-size: 20px; padding: 16px; }
 .reset   { background: #dc2626; width: 100%; }
 </style>
@@ -554,6 +593,9 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
     <div class="value" id="redPenalty">0</div>
     <button class="penalty" id="redAdd" onclick="penalty('red', 1)">＋ 罰分</button>
     <button class="undo" id="redUndo" onclick="penalty('red', -1)">撤銷 1 次</button>
+    <hr>
+    <button class="robot" id="redRobot" onclick="toggleRobot('red')">🤖 機器人</button>
+    <div class="label" id="redRobotInfo"></div>
   </div>
 
   <div class="card blue">
@@ -564,6 +606,9 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
     <div class="value" id="bluePenalty">0</div>
     <button class="penalty" id="blueAdd" onclick="penalty('blue', 1)">＋ 罰分</button>
     <button class="undo" id="blueUndo" onclick="penalty('blue', -1)">撤銷 1 次</button>
+    <hr>
+    <button class="robot" id="blueRobot" onclick="toggleRobot('blue')">🤖 機器人</button>
+    <div class="label" id="blueRobotInfo"></div>
   </div>
 
 </div>
@@ -578,10 +623,21 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
 
 <script>
 
-let state = 'waiting';  // 目前狀態
+let state = 'waiting';                        // 目前比賽狀態
+let robotOn = { red: true, blue: true };      // 兩台機器人是否已啟用
 
 function fmt(s) {
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+// 顯示某隊機器人的按鈕文字與狀態
+function showRobot(team, enabled, allowed) {
+  robotOn[team] = enabled;
+  const b = document.getElementById(team + 'Robot');
+  b.innerText = enabled ? '🤖 已啟用（點擊停用）' : '🤖 已停用（點擊啟用）';
+  b.style.background = enabled ? '#16a34a' : '#64748b';
+  document.getElementById(team + 'RobotInfo').innerText =
+    allowed ? '🟢 可移動' : (enabled ? '🔒 等待比賽開始' : '🔒 已停用');
 }
 
 async function update() {
@@ -619,6 +675,10 @@ async function update() {
     document.getElementById('bonusInfo').innerText =
       '🔴 ' + (d.redBonus > 0 ? '×2 剩 ' + d.redBonus + ' 秒' : '天秤 ' + d.redPress + '/' + d.pressNeeded) +
       '　🔵 ' + (d.blueBonus > 0 ? '×2 剩 ' + d.blueBonus + ' 秒' : '天秤 ' + d.bluePress + '/' + d.pressNeeded);
+
+    // 兩台機器人的啟用狀態
+    showRobot('red', d.robotRedEnabled, d.robotRedAllowed);
+    showRobot('blue', d.robotBlueEnabled, d.robotBlueAllowed);
 
     // 只有「進行中」才能記錄罰分
     const running = (state === 'running');
@@ -664,6 +724,12 @@ async function penalty(team, delta) {
   update();
 }
 
+// 啟用／停用某隊機器人
+async function toggleRobot(team) {
+  await fetch('/api/robot?team=' + team + '&enable=' + (robotOn[team] ? 0 : 1), { method: 'POST' });
+  update();
+}
+
 // 重設全部，回到等待開始
 async function resetAll() {
   if (!confirm('確定要重設全部嗎？')) return;
@@ -686,6 +752,7 @@ update();
 // 9. API：選手看板用
 // ======================================================
 
+// 未結算：回傳感測器原始得分；已結算：回傳扣除罰分後的最終分數
 void handleScoreApi() {
 
   bool settled = (gameState == SETTLED);
@@ -725,7 +792,11 @@ void handleStateApi() {
   json += "\"redPress\":" + String(pressCount[TEAM_RED]) + ",";
   json += "\"bluePress\":" + String(pressCount[TEAM_BLUE]) + ",";
   json += "\"redBonus\":" + String(bonusRemaining(TEAM_RED)) + ",";
-  json += "\"blueBonus\":" + String(bonusRemaining(TEAM_BLUE));
+  json += "\"blueBonus\":" + String(bonusRemaining(TEAM_BLUE)) + ",";
+  json += "\"robotRedEnabled\":" + String(robotEnabled[TEAM_RED] ? "true" : "false") + ",";
+  json += "\"robotBlueEnabled\":" + String(robotEnabled[TEAM_BLUE] ? "true" : "false") + ",";
+  json += "\"robotRedAllowed\":" + String(robotAllowed(TEAM_RED) ? "true" : "false") + ",";
+  json += "\"robotBlueAllowed\":" + String(robotAllowed(TEAM_BLUE) ? "true" : "false");
   json += "}";
 
   server.send(200, "application/json", json);
@@ -735,6 +806,7 @@ void handleStateApi() {
 // 11. API：開始（下一）輪
 // ======================================================
 
+// 等待中或已結算時才可開始；會清空分數與罰分並開始倒數
 void handleStart() {
 
   if (gameState == RUNNING) {
@@ -747,8 +819,8 @@ void handleStart() {
   redPenalty = 0;
   bluePenalty = 0;
 
-  clearBonusState();   // 清掉殘留的藍隊進球、天秤按壓與加倍
-  syncSensors();
+  clearBonusState();       // 清掉殘留的藍隊進球、天秤按壓與加倍
+  syncSensors();           // 同步感測器狀態，避免誤觸發
   roundStartTime = millis();
   gameState = RUNNING;
 
@@ -776,8 +848,11 @@ void handleSettle() {
 // 13. API：罰分（只記錄次數，不立刻扣分）
 // ======================================================
 
+// 用法：POST /api/penalty?team=red&delta=1   （增加一次罰分）
+//       POST /api/penalty?team=red&delta=-1  （撤銷一次罰分）
 void handlePenalty() {
 
+  // 只有比賽進行中才能修改罰分
   if (gameState != RUNNING) {
     server.send(409, "application/json", "{\"error\":\"Not running\"}");
     return;
@@ -834,13 +909,46 @@ void handleReset() {
 }
 
 // ======================================================
-// 15. 紅隊感測器處理
+// 15. API：啟用／停用機器人
+// ======================================================
+
+// 用法：POST /api/robot?team=red&enable=1   （啟用紅隊機器人）
+//       POST /api/robot?team=blue&enable=0  （停用藍隊機器人）
+void handleRobot() {
+
+  if (!server.hasArg("team") || !server.hasArg("enable")) {
+    server.send(400, "application/json", "{\"error\":\"Missing team or enable\"}");
+    return;
+  }
+
+  String team = server.arg("team");
+  bool enable = (server.arg("enable").toInt() != 0);
+
+  if (team == "red") {
+    robotEnabled[TEAM_RED] = enable;
+  } else if (team == "blue") {
+    robotEnabled[TEAM_BLUE] = enable;
+  } else {
+    server.send(400, "application/json", "{\"error\":\"Invalid team\"}");
+    return;
+  }
+
+  Serial.printf("[機器人] 裁判已%s%s機器人\n",
+                enable ? "啟用" : "停用", team == "red" ? "紅隊" : "藍隊");
+
+  sendRobotState();   // 立刻通知機器人，不等下一次定時廣播
+  handleStateApi();
+}
+
+// ======================================================
+// 16. 紅隊感測器處理
 // ======================================================
 
 void handleRedSensor(unsigned long now) {
 
   int reading = digitalRead(RED_SENSOR_PIN);
 
+  // 訊號變化：記錄新狀態並重新計時（防彈跳）
   if (reading != redRawState) {
     redRawState = reading;
     redStateChangeTime = now;
@@ -856,12 +964,13 @@ void handleRedSensor(unsigned long now) {
 
     if (redStableState == LOW && !redLocked) {
 
+      // 只有比賽進行中才加分（加倍中每球 2 分）
       if (gameState == RUNNING) {
         redScore += goalValue(TEAM_RED);
         Serial.printf("[感測器進球] 🔴 紅隊進球！紅: %d | 藍: %d\n",
                       redScore, blueScore);
       }
-      redLocked = true;
+      redLocked = true;   // 球停在感測器前只算一次
     }
 
     if (redStableState == HIGH) {
@@ -871,7 +980,7 @@ void handleRedSensor(unsigned long now) {
 }
 
 // ======================================================
-// 16. 初始化 setup()
+// 17. 初始化 setup()
 // ======================================================
 
 void setup() {
@@ -881,45 +990,45 @@ void setup() {
   pinMode(RED_SENSOR_PIN, INPUT);
   syncSensors();
 
-  // 必須是 STATION 模式，ESP-NOW 才能和 Wi-Fi 同時使用
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);   // 關閉省電模式，否則可能漏收 ESP-NOW 封包
+  // 讓 ESP32 自己開 Wi-Fi 熱點（不需要路由器），最多同時 8 台裝置連線
+  WiFi.mode(WIFI_AP);
+  bool apOk = WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, 0, 8);
+  delay(100);
 
-  // 先印出 MAC 位址，填進節點與開關板程式的 MASTER_MAC
+  if (apOk) {
+    Serial.println("\n[系統通知] Wi-Fi 熱點已建立！");
+    Serial.printf("Wi-Fi 名稱：%s\n", AP_SSID);
+    Serial.printf("Wi-Fi 密碼：%s\n", AP_PASSWORD);
+    Serial.print("選手看板：http://");
+    Serial.println(WiFi.softAPIP());
+    Serial.print("裁判頁面：http://");
+    Serial.print(WiFi.softAPIP());
+    Serial.println("/referee");
+  } else {
+    Serial.println("\n[錯誤] Wi-Fi 熱點建立失敗！");
+  }
+
+  // 熱點模式下，ESP-NOW 要用「熱點的 MAC」，填進節點與開關板的 MASTER_MAC
   uint8_t mac[6];
-  esp_read_mac(mac, ESP_MAC_WIFI_STA);
-  Serial.printf("\n[重要] 主機 MAC 位址：%02X:%02X:%02X:%02X:%02X:%02X\n",
+  esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+  Serial.printf("[重要] 主機 MAC 位址：%02X:%02X:%02X:%02X:%02X:%02X\n",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   Serial.printf("[重要] 填入節點：{0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X}\n",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-  // 連接 Wi-Fi（最多等 15 秒）
-  WiFi.begin(ssid, password);
-  Serial.print("正在連接 Wi-Fi 網路");
-
-  unsigned long wifiStartTime = millis();
-  while (WiFi.status() != WL_CONNECTED &&
-         millis() - wifiStartTime < 15000) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n[系統通知] Wi-Fi 連接成功！");
-    Serial.print("選手看板：http://");
-    Serial.println(WiFi.localIP());
-    Serial.print("裁判頁面：http://");
-    Serial.print(WiFi.localIP());
-    Serial.println("/referee");
-    Serial.printf("Wi-Fi 頻道：%d（節點會自動搜尋這個頻道）\n", WiFi.channel());
-  } else {
-    Serial.println("\n[錯誤] Wi-Fi 連接失敗！");
-  }
-
-  // 初始化 ESP-NOW（必須在 Wi-Fi 連線之後，這樣才會使用路由器的頻道）
+  // 初始化 ESP-NOW（必須在熱點建立之後）
   if (esp_now_init() == ESP_OK) {
     esp_now_register_recv_cb(onEspNowRecv);
-    Serial.println("[系統通知] ESP-NOW 已啟動，等待藍隊節點與天秤開關板");
+
+    // 加入廣播對象（用來通知兩台機器人）
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, BROADCAST_MAC, 6);
+    peer.channel = 0;           // 0 = 使用目前頻道
+    peer.ifidx = WIFI_IF_AP;    // 主機是熱點模式，所以用 AP 介面
+    peer.encrypt = false;
+    esp_now_add_peer(&peer);
+
+    Serial.println("[系統通知] ESP-NOW 已啟動，等待節點、開關板，並可通知機器人");
   } else {
     Serial.println("[錯誤] ESP-NOW 初始化失敗！");
   }
@@ -928,37 +1037,41 @@ void setup() {
   server.on("/", HTTP_GET, handleDisplayPage);
   server.on("/referee", HTTP_GET, handleRefereePage);
 
-  // API
+  // API（裁判的操作只開放 POST，避免誤觸）
   server.on("/api/score", HTTP_GET, handleScoreApi);
   server.on("/api/state", HTTP_GET, handleStateApi);
   server.on("/api/start", HTTP_POST, handleStart);
   server.on("/api/settle", HTTP_POST, handleSettle);
   server.on("/api/penalty", HTTP_POST, handlePenalty);
   server.on("/api/reset", HTTP_POST, handleReset);
+  server.on("/api/robot", HTTP_POST, handleRobot);
 
   server.begin();
   Serial.println("[系統通知] 網頁伺服器已啟動！等待裁判開始比賽");
 }
 
 // ======================================================
-// 17. 主迴圈 loop()
+// 18. 主迴圈 loop()
 // ======================================================
 
 void loop() {
 
-  server.handleClient();
+  server.handleClient();       // 處理網頁請求
 
   unsigned long now = millis();
 
-  updateBonus(now);       // 加倍時間到就關閉
+  updateBonus(now);            // 加倍時間到就關閉
 
-  // 時間到 -> 自動結算
+  // 時間到 -> 自動結算，並停在結算狀態等裁判開始下一輪
   if (gameState == RUNNING && now - roundStartTime >= ROUND_MS) {
     Serial.println("[系統通知] 時間到，自動結算！");
     settleRound();
   }
 
-  handleRedSensor(now);   // 紅隊感測器（本機）
-  processBlueGoals();     // 藍隊進球（來自節點）
-  processSwitchPresses(); // 天秤按壓（來自開關板）
+  handleRedSensor(now);        // 紅隊感測器（本機）
+  processBlueGoals();          // 藍隊進球（來自節點）
+  processSwitchPresses();      // 天秤按壓（來自開關板）
+
+  // 定時通知兩台機器人「現在可不可以動」
+  if (millis() - lastRobotSend >= ROBOT_SEND_MS) sendRobotState();
 }
