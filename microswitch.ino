@@ -26,7 +26,7 @@
 
 // ★ 必須改成主機序列埠印出的「填入節點：{...}」那一行！
 //   （舊值 1C:9D:C2:F8:AD:00 是路由器模式的 MAC，熱點版主機不能用）
-uint8_t MASTER_MAC[6] = {0x1C, 0x9D, 0xC2, 0xF8, 0xAD, 0x00};
+uint8_t MASTER_MAC[6] = {0x1C, 0x9D, 0xC2, 0xF8, 0x94, 0x59};
 
 #define RED_SWITCH_PIN   25   // 紅隊天秤開關
 #define BLUE_SWITCH_PIN  26   // 藍隊天秤開關
